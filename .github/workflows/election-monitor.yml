@@ -1,0 +1,57 @@
+name: PA Election Monitor
+
+on:
+  schedule:
+    # Runs at 12:00 UTC daily = 8:00am ET (7:00am during EDT... adjust as needed)
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}   # adds a manual "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write   # lets the workflow commit snapshots back to the repo
+  issues: write      # lets the workflow open an issue when it finds changes
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        run: |
+          python3 pa_election_monitor.py \
+            --sources election_monitor_sources.csv \
+            --state-dir ./election_monitor_state \
+            --outdir ./election_monitor_reports \
+            --workers 6 \
+            --delay 0.75 \
+            | tee run_output.txt
+
+      - name: Commit updated snapshots + reports
+        run: |
+          git config user.name "election-monitor-bot"
+          git config user.email "actions@github.com"
+          git add election_monitor_state election_monitor_reports
+          git diff --cached --quiet || git commit -m "Update snapshots $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+
+      - name: Open an issue if changes were detected
+        if: contains(fromJSON('true'), true)  # always evaluates; refined by grep below
+        run: |
+          if grep -q "Changed: 0" run_output.txt; then
+            echo "No changes detected -- skipping issue."
+          else
+            gh issue create \
+              --title "Election monitor: changes detected $(date -u +'%Y-%m-%d')" \
+              --body-file run_output.txt
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
