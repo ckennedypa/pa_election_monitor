@@ -3,31 +3,41 @@
 pa_election_monitor.py
 
 Monitors the PA Department of State newsroom plus all 67 county election
-board / voter services pages for changes, flags noteworthy announcements
-(deadline changes, polling place closures, audits, recounts, litigation,
-etc.), and keeps a running snapshot so each run only shows what's new.
+board / voter services pages for changes -- but only notifies you when a
+change touches voter protection or a public hearing, and tells you exactly
+what the new text says (not just "something changed").
+
+CATEGORIES IT WATCHES FOR
+--------------------------
+  - Polling Place Changes            (relocations, consolidations)
+  - Closures & Emergencies           (closed offices, weather, power outages)
+  - Registration & Deadlines         (new/extended registration or voting deadlines)
+  - Ballot Curing & Provisional      (curing process, provisional/rejected ballots)
+  - Mail & Drop Box Voting           (drop box changes, mail/absentee ballot rules)
+  - Accessibility & Language Access  (ADA, interpreters, curbside voting)
+  - Legal Action & Election Integrity (lawsuits, recounts, audits, security)
+  - Public Hearings & Meetings       (board of elections meetings, canvass/
+                                       certification hearings, public comment)
+
+Everything else -- a rotating banner, a staff photo, a font tweak -- is
+ignored on purpose, even if the page's text technically changed. Edit
+VOTER_PROTECTION_CATEGORIES below to add/remove phrases for what you
+personally want flagged.
 
 FIRST RUN just establishes a baseline for every source (nothing to compare
-yet). Run it again later -- daily via cron/launchd is typical -- to see
+yet). Run it again later -- daily via cron/launchd/GitHub Actions -- to see
 what changed since last time.
 
 USAGE
 -----
     pip3 install requests beautifulsoup4 --break-system-packages
-
     python3 pa_election_monitor.py --sources election_monitor_sources.csv
-
-    # tune concurrency / politeness / sensitivity
-    python3 pa_election_monitor.py --sources election_monitor_sources.csv \
-        --workers 6 --delay 0.75 --similarity-threshold 0.98
 
 INPUT
 -----
 --sources CSV: Name, URL, Type
     Type is just a label (e.g. "state"/"county") used for grouping in the
-    report -- edit or extend election_monitor_sources.csv freely, it already
-    ships with the PA DOS newsroom + all 67 county pages pre-filled from
-    pa.gov's official county contact directory.
+    report.
 
 STATE / SNAPSHOTS
 ------------------
@@ -35,19 +45,6 @@ One JSON snapshot per source is kept under --state-dir (default
 ./election_monitor_state/). Delete that folder to wipe baselines and start
 fresh. Snapshots store the cleaned page text, not raw HTML, so diffs ignore
 markup churn.
-
-WHY SIMILARITY THRESHOLD + KEYWORDS
-------------------------------------
-Government sites change constantly in trivial ways (a "last updated" date,
-a rotating banner). Rather than flag every twitch, a page only gets flagged
-as CHANGED if either:
-  (a) the overall text similarity to the last snapshot drops below
-      --similarity-threshold (default 0.985), or
-  (b) any added text contains one of the PRIORITY_KEYWORDS below --
-      these always get flagged even if the change is small, since a single
-      new line like "Polling place moved" matters far more than its length
-      suggests.
-Edit PRIORITY_KEYWORDS to match what you personally care about tracking.
 """
 
 import argparse
@@ -59,7 +56,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from difflib import SequenceMatcher, unified_diff
+from difflib import unified_diff
 from pathlib import Path
 
 import requests
@@ -68,15 +65,40 @@ from bs4 import BeautifulSoup
 USER_AGENT = "Mozilla/5.0 (compatible; DelcoAccentElectionMonitor/1.0; +https://delcoaccent.org)"
 REQUEST_TIMEOUT = 20
 
-# Always-flag keywords -- edit freely to match what you care about tracking.
-PRIORITY_KEYWORDS = [
-    "recount", "audit", "lawsuit", "litigation", "consent decree",
-    "polling place", "poll location", "closed", "closure", "relocat",
-    "emergency", "extend", "extension", "deadline", "cancel",
-    "recall", "special election", "vacan", "certif", "provisional",
-    "drop box", "ballot return", "curing", "cure", "reject", "security breach",
-    "resign", "appoint", "hire", "hearing", "meeting notice",
-]
+# Only text added under one of these categories triggers a notification.
+# Edit freely -- add phrases, add/remove whole categories.
+VOTER_PROTECTION_CATEGORIES = {
+    "Polling Place Changes": [
+        "polling place", "poll location", "voting location", "relocat", "consolidat",
+    ],
+    "Closures & Emergencies": [
+        "closed", "closure", "emergency", "cancel", "delayed opening",
+        "power outage", "evacuat", "inclement weather",
+    ],
+    "Registration & Deadlines": [
+        "deadline", "extend", "extension", "register to vote",
+        "registration deadline", "last day to", "voter registration",
+    ],
+    "Ballot Curing & Provisional Ballots": [
+        "curing", "cure your ballot", "provisional ballot", "reject",
+        "naked ballot", "signature mismatch", "cured by",
+    ],
+    "Mail & Drop Box Voting": [
+        "drop box", "mail ballot", "mail-in ballot", "absentee ballot", "ballot return",
+    ],
+    "Accessibility & Language Access": [
+        "ada accessib", "language access", "interpreter", "accessible voting", "curbside voting",
+    ],
+    "Legal Action & Election Integrity": [
+        "lawsuit", "litigation", "consent decree", "recount", "audit",
+        "security breach", "recall",
+    ],
+    "Public Hearings & Meetings": [
+        "public hearing", "public comment", "board of elections meeting",
+        "canvass meeting", "meeting notice", "special meeting", "agenda",
+        "certification hearing",
+    ],
+}
 
 # Boilerplate that changes on every page load and shouldn't count as a "real" change
 NOISE_PATTERNS = [
@@ -132,15 +154,24 @@ def save_snapshot(state_dir, name, url, text):
     }))
 
 
-def find_priority_hits(diff_lines):
-    added_text = " ".join(
-        ln[1:] for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++")
-    ).lower()
-    return sorted({kw for kw in PRIORITY_KEYWORDS if kw in added_text})
+def find_category_hits(diff_lines):
+    """Returns {category: [matched added lines]} for lines that were newly added."""
+    added_lines = [
+        ln[1:].strip() for ln in diff_lines
+        if ln.startswith("+") and not ln.startswith("+++")
+    ]
+    added_lines = [ln for ln in added_lines if ln]
+
+    hits = {}
+    for category, keywords in VOTER_PROTECTION_CATEGORIES.items():
+        matched = [ln for ln in added_lines if any(kw in ln.lower() for kw in keywords)]
+        if matched:
+            hits[category] = matched[:5]  # cap per-category snippet length
+    return hits
 
 
-def check_source(state_dir, name, url, text, similarity_threshold):
-    """Returns a tuple describing this source's status: 'new', 'unchanged', or a change record."""
+def check_source(state_dir, name, url, text):
+    """Returns ('new',), ('unchanged',), or ('changed', {category: [lines]})."""
     prior = load_snapshot(state_dir, name)
     if prior is None:
         save_snapshot(state_dir, name, url, text)
@@ -150,17 +181,15 @@ def check_source(state_dir, name, url, text, similarity_threshold):
     if new_hash == prior["hash"]:
         return ("unchanged",)
 
-    ratio = SequenceMatcher(None, prior["text"], text).ratio()
     diff_lines = list(unified_diff(prior["text"].splitlines(), text.splitlines(), lineterm="", n=0))
-    hits = find_priority_hits(diff_lines)
+    category_hits = find_category_hits(diff_lines)
 
     save_snapshot(state_dir, name, url, text)  # always advance the snapshot
 
-    if ratio < similarity_threshold or hits:
-        added = [ln[1:].strip() for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++")]
-        added = [ln for ln in added if ln][:8]
-        return ("changed", ratio, hits, added)
+    if category_hits:
+        return ("changed", category_hits)
 
+    # page content changed, but nothing voter-protection/hearing relevant -- stay quiet
     return ("unchanged",)
 
 
@@ -169,21 +198,22 @@ def print_report(new_baselines, changed, unchanged, errors):
     print("=" * 70)
     print(f"PA ELECTION BOARD MONITOR -- {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 70)
-    print(f"Checked: {total}  |  Changed: {len(changed)}  |  Unchanged: {len(unchanged)}"
-          f"  |  New baselines: {len(new_baselines)}  |  Errors: {len(errors)}")
+    print(f"Checked: {total}  |  Voter-protection/hearing changes: {len(changed)}  |  "
+          f"No notable change: {len(unchanged)}  |  New baselines: {len(new_baselines)}  |  "
+          f"Errors: {len(errors)}")
     print()
 
     if changed:
-        print("-- CHANGES DETECTED (flagged keyword matches shown first) --")
-        for name, url, type_, ratio, hits, added in sorted(changed, key=lambda c: -len(c[4])):
-            flag = f"  [FLAGGED: {', '.join(hits)}]" if hits else ""
-            print(f"\n* {name} ({type_}){flag}")
+        print("-- VOTER PROTECTION / PUBLIC HEARING CHANGES DETECTED --")
+        for name, url, type_, category_hits in changed:
+            print(f"\n* {name} ({type_})")
             print(f"  {url}")
-            print(f"  text similarity to last check: {ratio:.3f}")
-            for line in added[:5]:
-                print(f"    + {line[:120]}")
+            for category, lines in category_hits.items():
+                print(f"  [{category}]")
+                for line in lines:
+                    print(f"    + {line[:200]}")
     else:
-        print("No changes detected since last run.")
+        print("No voter-protection or public-hearing changes detected since last run.")
 
     if new_baselines:
         print(f"\n-- New baselines established for {len(new_baselines)} source(s) "
@@ -201,21 +231,23 @@ def write_csv_report(changed, outdir):
     path = outdir / f"election_monitor_changes_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Name", "URL", "Type", "SimilarityRatio", "FlaggedKeywords", "SampleAddedText"])
-        for name, url, type_, ratio, hits, added in changed:
-            writer.writerow([name, url, type_, f"{ratio:.3f}", "; ".join(hits), " | ".join(added[:3])])
+        writer.writerow(["Name", "URL", "Type", "Category", "ChangeText"])
+        for name, url, type_, category_hits in changed:
+            for category, lines in category_hits.items():
+                for line in lines:
+                    writer.writerow([name, url, type_, category, line])
     return path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor PA county election boards + DOS for changes")
+    parser = argparse.ArgumentParser(
+        description="Monitor PA county election boards + DOS for voter-protection/hearing changes"
+    )
     parser.add_argument("--sources", required=True, help="CSV of Name,URL,Type to monitor")
     parser.add_argument("--state-dir", default="./election_monitor_state", help="Where snapshots are stored")
     parser.add_argument("--outdir", default="./election_monitor_reports", help="Where reports are saved")
     parser.add_argument("--workers", type=int, default=5, help="Concurrent fetches (keep this modest -- be polite)")
     parser.add_argument("--delay", type=float, default=0.5, help="Extra random delay (0-x sec) staggering requests")
-    parser.add_argument("--similarity-threshold", type=float, default=0.985,
-                         help="Below this text-similarity ratio (0-1), a page counts as changed")
     args = parser.parse_args()
 
     state_dir = Path(args.state_dir)
@@ -246,14 +278,14 @@ def main():
             errors.append((name, url, err))
             continue
 
-        status = check_source(state_dir, name, url, text, args.similarity_threshold)
+        status = check_source(state_dir, name, url, text)
         if status[0] == "new":
             new_baselines.append((name, url, type_))
         elif status[0] == "unchanged":
             unchanged.append((name, url, type_))
         else:
-            _, ratio, hits, added = status
-            changed.append((name, url, type_, ratio, hits, added))
+            _, category_hits = status
+            changed.append((name, url, type_, category_hits))
 
     print_report(new_baselines, changed, unchanged, errors)
     csv_path = write_csv_report(changed, outdir)
