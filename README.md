@@ -1,7 +1,7 @@
 # pa_election_monitor
 script that monitors major changes or announcements from the 67 county boards of election in pennsylvania as well as the pa department of state
 
-DISCLOSURE: this is a volunteer-made python script created with Claude, and might make mistakes. This should not be used as the sole source of information in its current iteration, as testing of it is still necessary. To send feedback, please email ckennedypa@proton.me.
+DISCLOSURE: this is a volunteer-made python script created with Claude, and might make mistakes. This should not be used as the sole source of information in its current iteration, as testing of it is still necessary. To send feedback, please email ckennedy.pa@proton.me.
 
 Monitors the PA Department of State newsroom plus all 67 county election
 board / voter services pages for changes -- but only notifies you when a
